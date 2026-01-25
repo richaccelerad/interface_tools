@@ -2,34 +2,63 @@
 Monday.com API Client
 
 A reusable client for interacting with the Monday.com GraphQL API.
+Includes rate limiting with exponential backoff.
 """
 
 import requests
 import json
+import time
+import random
+import sys
 from typing import Optional
 
 
 class MondayClient:
-    """Client for interacting with Monday.com API."""
+    """Client for interacting with Monday.com API with rate limiting support."""
 
     API_URL = "https://api.monday.com/v2"
 
-    def __init__(self, api_token: str):
+    def __init__(self, api_token: str, max_retries: int = 5, base_delay: float = 1.0,
+                 max_delay: float = 60.0, verbose: bool = True):
         """
         Initialize the Monday.com client.
 
         Args:
             api_token: Your Monday.com API token
+            max_retries: Maximum number of retries on rate limit (default: 5)
+            base_delay: Base delay in seconds for exponential backoff (default: 1.0)
+            max_delay: Maximum delay in seconds between retries (default: 60.0)
+            verbose: Print rate limit warnings to stderr (default: True)
         """
         self.api_token = api_token
         self.headers = {
             "Authorization": api_token,
             "Content-Type": "application/json"
         }
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.verbose = verbose
+
+        # Rate limiting stats
+        self._rate_limit_hits = 0
+        self._total_requests = 0
+        self._total_retries = 0
+
+    @property
+    def rate_limit_stats(self) -> dict:
+        """Return rate limiting statistics."""
+        return {
+            "total_requests": self._total_requests,
+            "rate_limit_hits": self._rate_limit_hits,
+            "total_retries": self._total_retries,
+        }
 
     def execute_query(self, query: str, variables: Optional[dict] = None) -> dict:
         """
-        Execute a GraphQL query against Monday.com API.
+        Execute a GraphQL query against Monday.com API with rate limiting support.
+
+        Uses exponential backoff with jitter when rate limited (429 errors).
 
         Args:
             query: GraphQL query string
@@ -39,24 +68,94 @@ class MondayClient:
             The 'data' portion of the API response
 
         Raises:
-            Exception: If the API returns errors
+            Exception: If the API returns errors after all retries exhausted
         """
         payload = {"query": query}
         if variables:
             payload["variables"] = variables
 
-        response = requests.post(
-            self.API_URL,
-            headers=self.headers,
-            json=payload
-        )
-        response.raise_for_status()
-        result = response.json()
+        self._total_requests += 1
+        last_exception = None
 
-        if "errors" in result:
-            raise Exception(f"Monday.com API error: {result['errors']}")
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = requests.post(
+                    self.API_URL,
+                    headers=self.headers,
+                    json=payload
+                )
 
-        return result.get("data", {})
+                # Handle rate limiting (429)
+                if response.status_code == 429:
+                    self._rate_limit_hits += 1
+
+                    if attempt < self.max_retries:
+                        # Calculate delay with exponential backoff and jitter
+                        delay = min(self.base_delay * (2 ** attempt), self.max_delay)
+                        jitter = random.uniform(0, delay * 0.5)
+                        total_delay = delay + jitter
+
+                        # Check for Retry-After header
+                        retry_after = response.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                total_delay = max(total_delay, float(retry_after))
+                            except ValueError:
+                                pass
+
+                        if self.verbose:
+                            print(f"[Monday.com] Rate limited (429). "
+                                  f"Retry {attempt + 1}/{self.max_retries} in {total_delay:.1f}s...",
+                                  file=sys.stderr)
+
+                        self._total_retries += 1
+                        time.sleep(total_delay)
+                        continue
+                    else:
+                        # Max retries exhausted
+                        response.raise_for_status()
+
+                # Handle other HTTP errors
+                response.raise_for_status()
+
+                result = response.json()
+
+                if "errors" in result:
+                    # Check if it's a rate limit error in the response body
+                    error_str = str(result['errors'])
+                    if 'rate' in error_str.lower() or 'limit' in error_str.lower():
+                        self._rate_limit_hits += 1
+                        if attempt < self.max_retries:
+                            delay = min(self.base_delay * (2 ** attempt), self.max_delay)
+                            jitter = random.uniform(0, delay * 0.5)
+                            total_delay = delay + jitter
+
+                            if self.verbose:
+                                print(f"[Monday.com] Rate limit error in response. "
+                                      f"Retry {attempt + 1}/{self.max_retries} in {total_delay:.1f}s...",
+                                      file=sys.stderr)
+
+                            self._total_retries += 1
+                            time.sleep(total_delay)
+                            continue
+
+                    raise Exception(f"Monday.com API error: {result['errors']}")
+
+                return result.get("data", {})
+
+            except requests.exceptions.HTTPError as e:
+                last_exception = e
+                if e.response is not None and e.response.status_code == 429:
+                    # Already handled above, but just in case
+                    if attempt >= self.max_retries:
+                        raise
+                else:
+                    raise
+
+        # Should not reach here, but just in case
+        if last_exception:
+            raise last_exception
+        raise Exception("Monday.com API request failed after all retries")
 
     # -------------------------------------------------------------------------
     # Board Operations

@@ -31,6 +31,45 @@ _MISSING_PARAM_RE = re.compile(r"Parameter\s+([A-Za-z0-9_]+)\s+is not found in t
 
 
 @dataclass(frozen=True)
+class BOMComponent:
+    """A single component in a Bill of Materials."""
+    company: str
+    parent_part: str            # Assembly/parent part number
+    mtl_seq: int                # Material sequence number
+    part_num: str               # Component part number
+    description: Optional[str]  # Part description
+    qty_per: float              # Quantity per parent assembly
+    uom: Optional[str]          # Unit of measure
+    revision: Optional[str]     # Revision number
+    operation_seq: Optional[int]  # Related operation sequence
+    pull_as_asm: bool           # Pull as assembly (subassembly)
+    view_as_asm: bool           # View as assembly in BOM viewer
+    fixed_qty: bool             # Fixed quantity vs per-unit
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class BillOfMaterials:
+    """Bill of Materials for an assembly."""
+    company: str
+    part_num: str               # Assembly part number
+    revision: Optional[str]     # Revision number
+    description: Optional[str]  # Assembly description
+    components: List[BOMComponent]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "company": self.company,
+            "part_num": self.part_num,
+            "revision": self.revision,
+            "description": self.description,
+            "components": [c.to_dict() for c in self.components],
+        }
+
+
+@dataclass(frozen=True)
 class PartInventory:
     """Inventory information for a part number."""
     company: str
@@ -132,6 +171,7 @@ class EpicorClient:
         self._po_lines_cache: Dict[str, List[POLineMatch]] = {}
         self._qty_on_hand_cache: Dict[str, PartQtySummary] = {}
         self._part_description_cache: Dict[str, Optional[str]] = {}
+        self._part_class_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
 
         self.session = requests.Session()
         self.session.auth = (username, password)
@@ -158,6 +198,7 @@ class EpicorClient:
             "po_lines": len(self._po_lines_cache),
             "qty_on_hand": len(self._qty_on_hand_cache),
             "part_description": len(self._part_description_cache),
+            "part_class": len(self._part_class_cache),
         }
 
     def clear_cache(self) -> None:
@@ -165,6 +206,7 @@ class EpicorClient:
         self._po_lines_cache.clear()
         self._qty_on_hand_cache.clear()
         self._part_description_cache.clear()
+        self._part_class_cache.clear()
 
     def _post_json_raw(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         r = self.session.post(
@@ -637,3 +679,161 @@ class EpicorClient:
         # Cache and return result
         self._part_description_cache[partnum] = result
         return result
+
+    def get_part_class(self, partnum: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Get the part class (ClassID) and its description for a part number.
+
+        Returns a tuple of (ClassID, ClassDescription) from the Part table,
+        or (None, None) if not found.
+
+        Results are memoized per partnum for the lifetime of this client instance.
+        """
+        # Check cache first
+        if partnum in self._part_class_cache:
+            return self._part_class_cache[partnum]
+
+        result: Tuple[Optional[str], Optional[str]] = (None, None)
+        try:
+            records = self._get_odata(
+                "Erp.BO.PartSvc/Parts",
+                f"PartNum eq '{partnum}'",
+                ["PartNum", "ClassID", "ClassDescription"]
+            )
+            if records:
+                result = (
+                    records[0].get("ClassID"),
+                    records[0].get("ClassDescription")
+                )
+        except EpicorError:
+            pass
+
+        # Cache and return result
+        self._part_class_cache[partnum] = result
+        return result
+
+    def get_bom(self, partnum: str, revision: Optional[str] = None) -> BillOfMaterials:
+        """
+        Get the Bill of Materials for an assembly part number.
+
+        Queries Epicor's ECOMtl (Engineering Change Order Materials) table for
+        BOM components. Falls back to PartMtl if ECOMtl has no data.
+
+        Args:
+            partnum: The assembly part number
+            revision: Optional revision number. If not provided, uses the approved
+                     revision or the first available revision.
+
+        Returns:
+            BillOfMaterials containing all components.
+        """
+        # Get part description
+        description = self.get_part_description(partnum)
+
+        # If no revision specified, try to find the approved or latest revision
+        if revision is None:
+            revision = self._get_part_revision(partnum)
+
+        components: List[BOMComponent] = []
+
+        # Build filter clause
+        filter_clause = f"PartNum eq '{partnum}'"
+        if revision:
+            filter_clause += f" and RevisionNum eq '{revision}'"
+
+        # Query for BOM components - try ECOMtl first (Engineering), then PartMtl
+        mtl_endpoints = [
+            "Erp.BO.EngWorkBenchSvc/ECOMtls",  # Engineering Change Order materials
+            "Erp.BO.PartSvc/PartMtls",          # Standard part materials
+        ]
+
+        for endpoint in mtl_endpoints:
+            try:
+                records = self._get_odata(
+                    endpoint,
+                    filter_clause,
+                    None  # Get all fields - field names vary between endpoints
+                )
+                for rec in records:
+                    mtl_part = rec.get("MtlPartNum", "")
+                    if not mtl_part:
+                        continue
+
+                    # Get description - try multiple field names
+                    comp_desc = (
+                        rec.get("MtlPartNumPartDescription") or
+                        rec.get("MtlPartDescription") or
+                        rec.get("PartDescription")
+                    )
+                    if not comp_desc:
+                        comp_desc = self.get_part_description(mtl_part)
+
+                    # Get UOM - try multiple field names
+                    uom = rec.get("UOMCode") or rec.get("IUM") or rec.get("MtlPartNumIUM")
+
+                    components.append(BOMComponent(
+                        company=self.company,
+                        parent_part=partnum,
+                        mtl_seq=int(rec.get("MtlSeq", 0) or 0),
+                        part_num=str(mtl_part),
+                        description=comp_desc,
+                        qty_per=float(rec.get("QtyPer", 0) or 0),
+                        uom=uom,
+                        revision=rec.get("RevisionNum"),
+                        operation_seq=rec.get("RelatedOperation"),
+                        pull_as_asm=bool(rec.get("PullAsAsm", False)),
+                        view_as_asm=bool(rec.get("ViewAsAsm", False)),
+                        fixed_qty=bool(rec.get("FixedQty", False)),
+                    ))
+                if components:
+                    break
+            except EpicorError:
+                continue
+
+        # Sort components by material sequence
+        components.sort(key=lambda c: c.mtl_seq)
+
+        return BillOfMaterials(
+            company=self.company,
+            part_num=partnum,
+            revision=revision,
+            description=description,
+            components=components,
+        )
+
+    def _get_part_revision(self, partnum: str) -> Optional[str]:
+        """
+        Get the approved or latest revision for a part.
+
+        Checks both ECORev (Engineering) and PartRevs tables.
+        Returns the first approved revision, or the first revision if none approved.
+        """
+        # Try multiple endpoints for revision info
+        revision_endpoints = [
+            ("Erp.BO.EngWorkBenchSvc/EcoRevs", ["PartNum", "RevisionNum", "Approved", "EffectiveDate"]),
+            ("Erp.BO.PartSvc/PartRevs", ["PartNum", "RevisionNum", "Approved", "EffectiveDate"]),
+        ]
+
+        for endpoint, fields in revision_endpoints:
+            try:
+                records = self._get_odata(
+                    endpoint,
+                    f"PartNum eq '{partnum}'",
+                    fields
+                )
+                if not records:
+                    continue
+
+                # Prefer approved revisions
+                approved = [r for r in records if r.get("Approved")]
+                if approved:
+                    # Sort by effective date descending, return latest
+                    approved.sort(key=lambda r: r.get("EffectiveDate", "") or "", reverse=True)
+                    return approved[0].get("RevisionNum")
+
+                # No approved revisions, return first available
+                return records[0].get("RevisionNum")
+            except EpicorError:
+                continue
+
+        return None

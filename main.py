@@ -184,32 +184,62 @@ def format_inventory(inv_summary: PartQtySummary) -> str:
 def update_monday_item(monday: MondayClient, board_id: str, item_id: str,
                        column_ids: dict[str, str], categorized_pos: dict[str, list[POLineMatch]],
                        inventory: Optional[PartQtySummary] = None,
-                       part_description: Optional[str] = None) -> None:
-    """Update a Monday.com item with PO and inventory data."""
-    column_values = {}
+                       part_description: Optional[str] = None,
+                       existing_values: Optional[dict[str, str]] = None) -> bool:
+    """
+    Update a Monday.com item with PO and inventory data.
+
+    Only updates if values have changed from existing values.
+
+    Args:
+        existing_values: Dict of column_id -> current text value from Monday.com
+
+    Returns:
+        True if an update was made, False if skipped (no changes)
+    """
+    if existing_values is None:
+        existing_values = {}
+
+    # Build new values
+    new_values = {}
 
     if "open_pos" in column_ids:
-        column_values[column_ids["open_pos"]] = format_po_column(categorized_pos["open"])
+        new_values[column_ids["open_pos"]] = format_po_column(categorized_pos["open"])
 
     if "closed_pos_recent" in column_ids:
-        column_values[column_ids["closed_pos_recent"]] = format_po_column(categorized_pos["closed_recent"])
+        new_values[column_ids["closed_pos_recent"]] = format_po_column(categorized_pos["closed_recent"])
 
     if "closed_pos_old" in column_ids:
-        column_values[column_ids["closed_pos_old"]] = format_po_column(categorized_pos["closed_old"])
+        new_values[column_ids["closed_pos_old"]] = format_po_column(categorized_pos["closed_old"])
 
     if "qty_on_hand" in column_ids and inventory is not None:
         # For numeric column, just put the total
-        column_values[column_ids["qty_on_hand"]] = str(int(inventory.total_on_hand))
+        new_values[column_ids["qty_on_hand"]] = str(int(inventory.total_on_hand))
 
     if "location" in column_ids and inventory is not None:
         # Format location details: qty in warehouse/bin (job if applicable)
-        column_values[column_ids["location"]] = format_inventory(inventory)
+        new_values[column_ids["location"]] = format_inventory(inventory)
 
     if "part_description" in column_ids and part_description:
-        column_values[column_ids["part_description"]] = part_description
+        new_values[column_ids["part_description"]] = part_description
 
-    if column_values:
-        monday.update_item(board_id, item_id, column_values)
+    # Compare with existing values - only include changed columns
+    changed_values = {}
+    for col_id, new_val in new_values.items():
+        existing_val = existing_values.get(col_id, "")
+        # Normalize for comparison (strip whitespace, handle None)
+        new_normalized = (new_val or "").strip()
+        existing_normalized = (existing_val or "").strip()
+
+        if new_normalized != existing_normalized:
+            changed_values[col_id] = new_val
+
+    # Only update if there are actual changes
+    if changed_values:
+        monday.update_item(board_id, item_id, changed_values)
+        return True
+
+    return False
 
 
 def get_partnums_from_monday(monday: MondayClient, board_id: str) -> list[dict]:
@@ -259,11 +289,18 @@ def get_partnums_from_monday(monday: MondayClient, board_id: str) -> list[dict]:
         if not partnum:
             partnum = item_name
 
+        # Build a dict of existing column values (id -> text value)
+        existing_values = {}
+        for cv in item['column_values']:
+            # Use 'text' for display value comparison
+            existing_values[cv['id']] = cv['text'] or ""
+
         if partnum:
             results.append({
                 'item_id': item_id,
                 'item_name': item_name,
                 'partnum': partnum.strip(),
+                'existing_values': existing_values,
             })
 
     return results
@@ -274,11 +311,14 @@ def process_item(epicor: EpicorClient, monday: MondayClient, board_id: str,
     """
     Process a single item: look up POs and inventory in Epicor, update Monday.com.
 
+    Only updates Monday.com if data has changed.
+
     Returns a dict with processing results for aggregation.
     """
     partnum = item['partnum']
     item_id = item['item_id']
     item_name = item['item_name']
+    existing_values = item.get('existing_values', {})
 
     result = {
         'partnum': partnum,
@@ -289,6 +329,7 @@ def process_item(epicor: EpicorClient, monday: MondayClient, board_id: str,
         'inventory': None,
         'part_description': None,
         'error': None,
+        'updated': False,  # Track if Monday.com was updated
     }
 
     try:
@@ -312,9 +353,11 @@ def process_item(epicor: EpicorClient, monday: MondayClient, board_id: str,
         except Exception as inv_err:
             result['inventory_error'] = str(inv_err)
 
-        # Update Monday.com
-        update_monday_item(monday, board_id, item_id, column_ids, categorized,
-                          result['inventory'], result['part_description'])
+        # Update Monday.com (only if values changed)
+        result['updated'] = update_monday_item(
+            monday, board_id, item_id, column_ids, categorized,
+            result['inventory'], result['part_description'], existing_values
+        )
 
     except Exception as e:
         result['error'] = str(e)
@@ -349,16 +392,19 @@ def main(limit: Optional[int] = None):
         print(f"  (Limited to first {limit} items for testing)")
 
     # Look up POs for each item and update Monday.com (parallel processing)
+    # Using 3 workers to avoid hitting Monday.com rate limits
     print("\n" + "=" * 60)
     print("Looking up POs in Epicor and updating Monday.com...")
-    print(f"Processing {len(items)} items with 5 parallel workers...")
+    print(f"Processing {len(items)} items with 3 parallel workers...")
     print("=" * 60)
 
     all_results = {}
     completed_count = 0
     error_count = 0
+    updated_count = 0
+    skipped_count = 0
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         # Submit all tasks
         futures = {
             executor.submit(process_item, epicor, monday, config.MONDAY_PARTS_BOARD_ID, column_ids, item): item
@@ -375,6 +421,12 @@ def main(limit: Optional[int] = None):
                 partnum = result['partnum']
                 all_results[partnum] = result['po_lines']
 
+                # Track updates vs skips
+                if result.get('updated'):
+                    updated_count += 1
+                else:
+                    skipped_count += 1
+
                 # Print progress (results may be out of order)
                 status_parts = []
                 if result['error']:
@@ -388,6 +440,9 @@ def main(limit: Optional[int] = None):
                         status_parts.append(f"Inv: {result['inventory'].total_on_hand}")
                     elif result.get('inventory_error'):
                         status_parts.append("Inv: N/A")
+                    # Indicate if update was skipped
+                    if not result.get('updated'):
+                        status_parts.append("(no change)")
 
                 status = " | ".join(status_parts) if status_parts else "OK"
                 print(f"[{completed_count}/{len(items)}] {result['item_name']}: {status}")
@@ -406,8 +461,15 @@ def main(limit: Optional[int] = None):
     print(f"Items processed: {len(items)}")
     print(f"Parts with POs: {parts_with_pos}")
     print(f"Total PO lines found: {total_pos}")
+    print(f"Monday.com updates: {updated_count} updated, {skipped_count} unchanged")
     if error_count > 0:
         print(f"Errors: {error_count}")
+
+    # Show Monday.com rate limit stats if any retries occurred
+    rate_stats = monday.rate_limit_stats
+    if rate_stats["rate_limit_hits"] > 0:
+        print(f"Monday.com rate limits hit: {rate_stats['rate_limit_hits']} "
+              f"(retries: {rate_stats['total_retries']})")
 
     return all_results
 
