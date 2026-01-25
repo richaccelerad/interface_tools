@@ -9,6 +9,7 @@ from monday_client import MondayClient
 from epicor_po_x2 import EpicorClient, POLineMatch, PartQtySummary
 from datetime import datetime, timedelta
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import config
 
 
@@ -268,6 +269,59 @@ def get_partnums_from_monday(monday: MondayClient, board_id: str) -> list[dict]:
     return results
 
 
+def process_item(epicor: EpicorClient, monday: MondayClient, board_id: str,
+                  column_ids: dict[str, str], item: dict) -> dict:
+    """
+    Process a single item: look up POs and inventory in Epicor, update Monday.com.
+
+    Returns a dict with processing results for aggregation.
+    """
+    partnum = item['partnum']
+    item_id = item['item_id']
+    item_name = item['item_name']
+
+    result = {
+        'partnum': partnum,
+        'item_name': item_name,
+        'item_id': item_id,
+        'po_lines': [],
+        'categorized': None,
+        'inventory': None,
+        'part_description': None,
+        'error': None,
+    }
+
+    try:
+        # Query Epicor for part description
+        try:
+            result['part_description'] = epicor.get_part_description(partnum)
+        except Exception:
+            pass
+
+        # Query Epicor for POs
+        po_lines = epicor.get_po_lines_by_partnum(partnum)
+        result['po_lines'] = po_lines
+
+        # Categorize POs
+        categorized = categorize_pos(po_lines)
+        result['categorized'] = categorized
+
+        # Query Epicor for inventory
+        try:
+            result['inventory'] = epicor.get_qty_on_hand(partnum)
+        except Exception as inv_err:
+            result['inventory_error'] = str(inv_err)
+
+        # Update Monday.com
+        update_monday_item(monday, board_id, item_id, column_ids, categorized,
+                          result['inventory'], result['part_description'])
+
+    except Exception as e:
+        result['error'] = str(e)
+
+    return result
+
+
 def main(limit: Optional[int] = None):
     print("=" * 60)
     print("Epicor -> Monday.com PO Sync")
@@ -294,58 +348,54 @@ def main(limit: Optional[int] = None):
         items = items[:limit]
         print(f"  (Limited to first {limit} items for testing)")
 
-    # Look up POs for each item and update Monday.com
+    # Look up POs for each item and update Monday.com (parallel processing)
     print("\n" + "=" * 60)
     print("Looking up POs in Epicor and updating Monday.com...")
+    print(f"Processing {len(items)} items with 5 parallel workers...")
     print("=" * 60)
 
     all_results = {}
-    for item in items:
-        partnum = item['partnum']
-        item_id = item['item_id']
-        item_name = item['item_name']
+    completed_count = 0
+    error_count = 0
 
-        print(f"\nProcessing: {item_name} (PartNum: {partnum})")
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit all tasks
+        futures = {
+            executor.submit(process_item, epicor, monday, config.MONDAY_PARTS_BOARD_ID, column_ids, item): item
+            for item in items
+        }
 
-        try:
-            # Query Epicor for part description
-            part_description = None
+        # Process results as they complete
+        for future in as_completed(futures):
+            item = futures[future]
+            completed_count += 1
+
             try:
-                part_description = epicor.get_part_description(partnum)
-                if part_description:
-                    print(f"  Description: {part_description}")
-            except Exception:
-                pass
+                result = future.result()
+                partnum = result['partnum']
+                all_results[partnum] = result['po_lines']
 
-            # Query Epicor for POs
-            po_lines = epicor.get_po_lines_by_partnum(partnum)
-            all_results[partnum] = po_lines
+                # Print progress (results may be out of order)
+                status_parts = []
+                if result['error']:
+                    error_count += 1
+                    status_parts.append(f"ERROR: {result['error']}")
+                else:
+                    if result['categorized']:
+                        cat = result['categorized']
+                        status_parts.append(f"POs: {len(cat['open'])} open, {len(cat['closed_recent'])} recent, {len(cat['closed_old'])} old")
+                    if result['inventory']:
+                        status_parts.append(f"Inv: {result['inventory'].total_on_hand}")
+                    elif result.get('inventory_error'):
+                        status_parts.append("Inv: N/A")
 
-            # Categorize POs
-            categorized = categorize_pos(po_lines)
+                status = " | ".join(status_parts) if status_parts else "OK"
+                print(f"[{completed_count}/{len(items)}] {result['item_name']}: {status}")
 
-            print(f"  POs: {len(categorized['open'])} open, "
-                  f"{len(categorized['closed_recent'])} closed (recent), "
-                  f"{len(categorized['closed_old'])} closed (old)")
-
-            # Query Epicor for inventory
-            inventory = None
-            try:
-                inventory = epicor.get_qty_on_hand(partnum)
-                print(f"  Inventory: {inventory.total_on_hand} on hand")
-                for inv in inventory.by_location:
-                    job_info = f" (Job {inv.job_num})" if inv.job_num else ""
-                    print(f"    - {inv.on_hand_qty} in {inv.warehouse}/{inv.bin_num}{job_info}")
-            except Exception as inv_err:
-                print(f"  Inventory: Could not retrieve ({inv_err})")
-
-            # Update Monday.com
-            update_monday_item(monday, config.MONDAY_PARTS_BOARD_ID, item_id, column_ids, categorized, inventory, part_description)
-            print(f"  Updated Monday.com item {item_id}")
-
-        except Exception as e:
-            print(f"  Error: {e}")
-            all_results[partnum] = []
+            except Exception as e:
+                error_count += 1
+                all_results[item['partnum']] = []
+                print(f"[{completed_count}/{len(items)}] {item['item_name']}: FAILED - {e}")
 
     # Summary
     print("\n" + "=" * 60)
@@ -356,6 +406,8 @@ def main(limit: Optional[int] = None):
     print(f"Items processed: {len(items)}")
     print(f"Parts with POs: {parts_with_pos}")
     print(f"Total PO lines found: {total_pos}")
+    if error_count > 0:
+        print(f"Errors: {error_count}")
 
     return all_results
 

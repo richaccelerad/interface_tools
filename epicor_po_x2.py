@@ -128,6 +128,11 @@ class EpicorClient:
         # Start with hardcoded extras unless caller provides their own.
         self._getrows_extras: Dict[str, Any] = dict(getrows_extras) if getrows_extras is not None else dict(DEFAULT_GETROWS_EXTRAS)
 
+        # Memoization caches for expensive API calls
+        self._po_lines_cache: Dict[str, List[POLineMatch]] = {}
+        self._qty_on_hand_cache: Dict[str, PartQtySummary] = {}
+        self._part_description_cache: Dict[str, Optional[str]] = {}
+
         self.session = requests.Session()
         self.session.auth = (username, password)
 
@@ -145,6 +150,21 @@ class EpicorClient:
     def getrows_extras(self) -> Dict[str, Any]:
         """Current GetRows extras (including any newly learned params)."""
         return dict(self._getrows_extras)
+
+    @property
+    def cache_stats(self) -> Dict[str, int]:
+        """Return the number of cached entries for each cache type."""
+        return {
+            "po_lines": len(self._po_lines_cache),
+            "qty_on_hand": len(self._qty_on_hand_cache),
+            "part_description": len(self._part_description_cache),
+        }
+
+    def clear_cache(self) -> None:
+        """Clear all memoization caches."""
+        self._po_lines_cache.clear()
+        self._qty_on_hand_cache.clear()
+        self._part_description_cache.clear()
 
     def _post_json_raw(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         r = self.session.post(
@@ -237,7 +257,13 @@ class EpicorClient:
         Received complete (best-effort):
           - if received_qty and order_qty are present: received_qty >= order_qty AND status != open
           - else None
+
+        Results are memoized per partnum for the lifetime of this client instance.
         """
+        # Check cache first
+        if partnum in self._po_lines_cache:
+            return self._po_lines_cache[partnum]
+
         url = f"{self.base_url}/api/v2/odata/{self.company}/Erp.BO.POSvc/GetRows"
 
         all_poheader: List[Dict[str, Any]] = []
@@ -407,6 +433,8 @@ class EpicorClient:
                 )
             )
 
+        # Cache and return results
+        self._po_lines_cache[partnum] = results
         return results
 
     def _get_odata(self, endpoint: str, filter_clause: str, select_fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -448,7 +476,13 @@ class EpicorClient:
         4. Part service for summary quantities
 
         Returns a PartQtySummary with total on-hand qty and breakdown by location/job.
+
+        Results are memoized per partnum for the lifetime of this client instance.
         """
+        # Check cache first
+        if partnum in self._qty_on_hand_cache:
+            return self._qty_on_hand_cache[partnum]
+
         inventory_list: List[PartInventory] = []
         total_qty = 0.0
 
@@ -520,12 +554,16 @@ class EpicorClient:
         except EpicorError:
             pass
 
-        return PartQtySummary(
+        result = PartQtySummary(
             company=self.company,
             part_num=partnum,
             total_on_hand=total_qty,
             by_location=inventory_list,
         )
+
+        # Cache and return result
+        self._qty_on_hand_cache[partnum] = result
+        return result
 
     def _get_received_qty(self, partnum: str) -> List[Tuple[str, str, float]]:
         """
@@ -577,7 +615,14 @@ class EpicorClient:
         Get the description for a part number.
 
         Returns the PartDescription from the Part table, or None if not found.
+
+        Results are memoized per partnum for the lifetime of this client instance.
         """
+        # Check cache first (use 'in' to distinguish cached None from not-cached)
+        if partnum in self._part_description_cache:
+            return self._part_description_cache[partnum]
+
+        result: Optional[str] = None
         try:
             records = self._get_odata(
                 "Erp.BO.PartSvc/Parts",
@@ -585,7 +630,10 @@ class EpicorClient:
                 ["PartNum", "PartDescription"]
             )
             if records:
-                return records[0].get("PartDescription")
+                result = records[0].get("PartDescription")
         except EpicorError:
             pass
-        return None
+
+        # Cache and return result
+        self._part_description_cache[partnum] = result
+        return result
