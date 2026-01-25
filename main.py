@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import config
+import sys
 
 
 def get_monday_client() -> MondayClient:
@@ -236,9 +237,11 @@ def update_monday_item(monday: MondayClient, board_id: str, item_id: str,
 
     # Only update if there are actual changes
     if changed_values:
+        print(f"[DEBUG] Updating item {item_id} - {len(changed_values)} columns changed", file=sys.stderr)
         monday.update_item(board_id, item_id, changed_values)
         return True
 
+    print(f"[DEBUG] Skipping item {item_id} - no changes", file=sys.stderr)
     return False
 
 
@@ -365,7 +368,7 @@ def process_item(epicor: EpicorClient, monday: MondayClient, board_id: str,
     return result
 
 
-def main(limit: Optional[int] = None):
+def main(limit: Optional[int] = None, sequential: bool = False):
     print("=" * 60)
     print("Epicor -> Monday.com PO Sync")
     print("=" * 60)
@@ -391,11 +394,13 @@ def main(limit: Optional[int] = None):
         items = items[:limit]
         print(f"  (Limited to first {limit} items for testing)")
 
-    # Look up POs for each item and update Monday.com (parallel processing)
-    # Using 3 workers to avoid hitting Monday.com rate limits
+    # Look up POs for each item and update Monday.com
     print("\n" + "=" * 60)
     print("Looking up POs in Epicor and updating Monday.com...")
-    print(f"Processing {len(items)} items with 3 parallel workers...")
+    if sequential:
+        print(f"Processing {len(items)} items sequentially...")
+    else:
+        print(f"Processing {len(items)} items with 3 parallel workers...")
     print("=" * 60)
 
     all_results = {}
@@ -404,53 +409,69 @@ def main(limit: Optional[int] = None):
     updated_count = 0
     skipped_count = 0
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        # Submit all tasks
-        futures = {
-            executor.submit(process_item, epicor, monday, config.MONDAY_PARTS_BOARD_ID, column_ids, item): item
-            for item in items
-        }
+    def handle_result(result, item):
+        """Process a single result and update counters."""
+        nonlocal completed_count, error_count, updated_count, skipped_count
 
-        # Process results as they complete
-        for future in as_completed(futures):
-            item = futures[future]
-            completed_count += 1
+        completed_count += 1
+        partnum = result['partnum']
+        all_results[partnum] = result['po_lines']
 
+        # Track updates vs skips
+        if result.get('updated'):
+            updated_count += 1
+        else:
+            skipped_count += 1
+
+        # Print progress
+        status_parts = []
+        if result['error']:
+            error_count += 1
+            status_parts.append(f"ERROR: {result['error']}")
+        else:
+            if result['categorized']:
+                cat = result['categorized']
+                status_parts.append(f"POs: {len(cat['open'])} open, {len(cat['closed_recent'])} recent, {len(cat['closed_old'])} old")
+            if result['inventory']:
+                status_parts.append(f"Inv: {result['inventory'].total_on_hand}")
+            elif result.get('inventory_error'):
+                status_parts.append("Inv: N/A")
+            # Indicate if update was skipped
+            if not result.get('updated'):
+                status_parts.append("(no change)")
+
+        status = " | ".join(status_parts) if status_parts else "OK"
+        print(f"[{completed_count}/{len(items)}] {result['item_name']}: {status}")
+
+    if sequential:
+        # Sequential processing - one item at a time
+        for item in items:
             try:
-                result = future.result()
-                partnum = result['partnum']
-                all_results[partnum] = result['po_lines']
-
-                # Track updates vs skips
-                if result.get('updated'):
-                    updated_count += 1
-                else:
-                    skipped_count += 1
-
-                # Print progress (results may be out of order)
-                status_parts = []
-                if result['error']:
-                    error_count += 1
-                    status_parts.append(f"ERROR: {result['error']}")
-                else:
-                    if result['categorized']:
-                        cat = result['categorized']
-                        status_parts.append(f"POs: {len(cat['open'])} open, {len(cat['closed_recent'])} recent, {len(cat['closed_old'])} old")
-                    if result['inventory']:
-                        status_parts.append(f"Inv: {result['inventory'].total_on_hand}")
-                    elif result.get('inventory_error'):
-                        status_parts.append("Inv: N/A")
-                    # Indicate if update was skipped
-                    if not result.get('updated'):
-                        status_parts.append("(no change)")
-
-                status = " | ".join(status_parts) if status_parts else "OK"
-                print(f"[{completed_count}/{len(items)}] {result['item_name']}: {status}")
-
+                result = process_item(epicor, monday, config.MONDAY_PARTS_BOARD_ID, column_ids, item)
+                handle_result(result, item)
             except Exception as e:
+                completed_count += 1
                 error_count += 1
                 all_results[item['partnum']] = []
                 print(f"[{completed_count}/{len(items)}] {item['item_name']}: FAILED - {e}")
+    else:
+        # Parallel processing with thread pool
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(process_item, epicor, monday, config.MONDAY_PARTS_BOARD_ID, column_ids, item): item
+                for item in items
+            }
+
+            for future in as_completed(futures):
+                item = futures[future]
+                try:
+                    result = future.result()
+                    handle_result(result, item)
+                except Exception as e:
+                    completed_count += 1
+                    error_count += 1
+                    all_results[item['partnum']] = []
+                    print(f"[{completed_count}/{len(items)}] {item['item_name']}: FAILED - {e}")
 
     # Summary
     print("\n" + "=" * 60)
@@ -474,21 +495,171 @@ def main(limit: Optional[int] = None):
     return all_results
 
 
+def show_api_usage():
+    """Display Monday.com API usage statistics."""
+    print("=" * 60)
+    print("Monday.com API Usage")
+    print("=" * 60)
+
+    monday = get_monday_client()
+
+    try:
+        usage = monday.get_api_usage()
+
+        print("\nUsage by Day:")
+        print("-" * 40)
+        for day_data in usage["by_day"]:
+            print(f"  {day_data['day']}: {day_data['usage']:,} calls")
+
+        if usage["by_app"]:
+            print("\nUsage by App:")
+            print("-" * 40)
+            for app_data in usage["by_app"]:
+                print(f"  {app_data['app_name']}: {app_data['usage']:,} calls")
+
+        if usage["by_user"]:
+            print("\nUsage by User:")
+            print("-" * 40)
+            for user_data in usage["by_user"]:
+                print(f"  {user_data['user_name']}: {user_data['usage']:,} calls")
+
+        if usage["last_updated"]:
+            print(f"\nLast updated: {usage['last_updated']}")
+
+        # Calculate today's total
+        if usage["by_day"]:
+            today_usage = usage["by_day"][0]["usage"] if usage["by_day"] else 0
+            print(f"\nToday's usage: {today_usage:,} API calls")
+
+    except Exception as e:
+        print(f"Error fetching usage: {e}")
+
+
+def estimate_sync_calls(limit: Optional[int] = None):
+    """Estimate how many API calls a sync would use (dry run)."""
+    print("=" * 60)
+    print("Estimating API Calls (Dry Run)")
+    print("=" * 60)
+
+    monday = get_monday_client()
+
+    # These calls are needed just to estimate
+    print("\nCounting items on board...")
+    startup_calls = 0
+
+    try:
+        # 1 call: get board columns
+        startup_calls += 1
+        column_ids = get_column_ids(monday, config.MONDAY_PARTS_BOARD_ID)
+
+        # 1 call: get board info + 1 call: get items
+        startup_calls += 2
+        items = get_partnums_from_monday(monday, config.MONDAY_PARTS_BOARD_ID)
+
+        total_items = len(items)
+        if limit is not None and limit > 0:
+            items = items[:limit]
+            print(f"  Board has {total_items} items (limited to {limit} for this estimate)")
+        else:
+            print(f"  Board has {total_items} items")
+
+        items_to_process = len(items)
+
+        print(f"\nAPI Call Estimate:")
+        print("-" * 40)
+        print(f"  Startup calls (already used):     {startup_calls}")
+        print(f"  Items to process:                 {items_to_process}")
+        print(f"  Max update calls (if all change): {items_to_process}")
+        print(f"  -" * 20)
+        print(f"  WORST CASE TOTAL:                 {startup_calls + items_to_process}")
+        print(f"  BEST CASE (no changes):           {startup_calls}")
+
+        print(f"\nNote: Actual calls depend on how many items have changed data.")
+        print(f"      The change detection will skip items with no updates.")
+
+        # Show current usage for context
+        print(f"\nChecking current API usage...")
+        try:
+            usage = monday.get_api_usage()
+            if usage["by_day"]:
+                today = usage["by_day"][0]
+                print(f"  Today's usage so far: {today['usage']:,} calls (as of {today['day']})")
+                remaining_estimate = 10000 - today['usage']  # Assume 10k limit
+                print(f"  Estimated remaining (assuming 10k limit): ~{max(0, remaining_estimate):,} calls")
+        except:
+            pass
+
+    except Exception as e:
+        print(f"Error during estimation: {e}")
+        print("\nNote: This error consumed some API calls. If you hit the daily limit,")
+        print("      you'll need to wait until tomorrow to run the sync.")
+
+
 if __name__ == "__main__":
     import sys
+
+    # Show help
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print("""
+Epicor -> Monday.com PO Sync
+
+Usage:
+    python main.py [options]
+
+Options:
+    --sequential     Run sequentially (no threading) to avoid rate limits
+    --limit N        Process only the first N items
+    --usage          Show Monday.com API usage statistics
+    --dry-run        Estimate API calls without running sync
+    --configure      Configure board columns only
+
+Examples:
+    python main.py --usage                    # Check API usage
+    python main.py --dry-run                  # Estimate calls for full sync
+    python main.py --dry-run --limit 50       # Estimate calls for 50 items
+    python main.py --sequential --limit 50   # Run sync on 50 items
+""")
+        sys.exit(0)
 
     if len(sys.argv) > 1 and sys.argv[1] == "--configure":
         # Run board configuration only
         monday = get_monday_client()
         board_id = sys.argv[2] if len(sys.argv) > 2 else config.MONDAY_PARTS_BOARD_ID
         configure_board(monday, board_id)
-    else:
-        # Check for --limit N option
+
+    elif len(sys.argv) > 1 and sys.argv[1] == "--usage":
+        # Show API usage
+        show_api_usage()
+
+    elif "--dry-run" in sys.argv:
+        # Estimate API calls
         limit = None
-        for i, arg in enumerate(sys.argv[1:], 1):
+        for i, arg in enumerate(sys.argv):
             if arg == "--limit" and i + 1 < len(sys.argv):
                 try:
                     limit = int(sys.argv[i + 1])
                 except ValueError:
                     pass
-        main(limit=limit)
+        estimate_sync_calls(limit=limit)
+
+    else:
+        # Parse command line options
+        limit = None
+        sequential = False
+
+        i = 1
+        while i < len(sys.argv):
+            arg = sys.argv[i]
+            if arg == "--limit" and i + 1 < len(sys.argv):
+                try:
+                    limit = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif arg == "--sequential":
+                sequential = True
+                i += 1
+            else:
+                i += 1
+
+        main(limit=limit, sequential=sequential)

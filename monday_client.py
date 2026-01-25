@@ -18,16 +18,16 @@ class MondayClient:
 
     API_URL = "https://api.monday.com/v2"
 
-    def __init__(self, api_token: str, max_retries: int = 5, base_delay: float = 1.0,
-                 max_delay: float = 60.0, verbose: bool = True):
+    def __init__(self, api_token: str, max_retries: int = 10, base_delay: float = 2.0,
+                 max_delay: float = 120.0, verbose: bool = True):
         """
         Initialize the Monday.com client.
 
         Args:
             api_token: Your Monday.com API token
-            max_retries: Maximum number of retries on rate limit (default: 5)
-            base_delay: Base delay in seconds for exponential backoff (default: 1.0)
-            max_delay: Maximum delay in seconds between retries (default: 60.0)
+            max_retries: Maximum number of retries on rate limit (default: 10)
+            base_delay: Base delay in seconds for exponential backoff (default: 2.0)
+            max_delay: Maximum delay in seconds between retries (default: 120.0)
             verbose: Print rate limit warnings to stderr (default: True)
         """
         self.api_token = api_token
@@ -77,6 +77,13 @@ class MondayClient:
         self._total_requests += 1
         last_exception = None
 
+        # DEBUG: Log every API call
+        # Extract operation name from query for cleaner logging
+        import re
+        op_match = re.search(r'(query|mutation)\s*(\w*)', query)
+        op_name = op_match.group(2) if op_match and op_match.group(2) else (op_match.group(1) if op_match else "unknown")
+        print(f"[DEBUG Monday API #{self._total_requests}] {op_name}", file=sys.stderr)
+
         for attempt in range(self.max_retries + 1):
             try:
                 response = requests.post(
@@ -88,6 +95,26 @@ class MondayClient:
                 # Handle rate limiting (429)
                 if response.status_code == 429:
                     self._rate_limit_hits += 1
+
+                    # Check if this is a DAILY limit (no point retrying)
+                    try:
+                        error_body = response.json()
+                        error_code = error_body.get("errors", [{}])[0].get("extensions", {}).get("code", "")
+                        error_msg = error_body.get("errors", [{}])[0].get("message", "")
+
+                        if error_code == "DAILY_LIMIT_EXCEEDED" or "daily" in error_msg.lower():
+                            raise Exception(
+                                f"Monday.com DAILY API LIMIT EXCEEDED. "
+                                f"Your account has used all API calls for today. "
+                                f"The limit resets at midnight (Monday.com timezone). "
+                                f"No point retrying - please try again tomorrow."
+                            )
+                    except json.JSONDecodeError:
+                        pass
+
+                    # DEBUG: Log rate limit info
+                    if self.verbose:
+                        print(f"[DEBUG Monday API] 429 response", file=sys.stderr)
 
                     if attempt < self.max_retries:
                         # Calculate delay with exponential backoff and jitter
@@ -425,6 +452,69 @@ class MondayClient:
         """
         result = self.execute_query(query, {"boardId": board_id, "groupName": group_name})
         return result["create_group"]["id"]
+
+    # -------------------------------------------------------------------------
+    # API Usage / Analytics
+    # -------------------------------------------------------------------------
+
+    def get_api_usage(self) -> dict:
+        """
+        Get API usage analytics for the account.
+
+        Returns a dict with:
+        - by_day: List of {day, usage} for recent days
+        - by_app: List of {app_name, api_app_id, usage}
+        - by_user: List of {user_name, usage}
+        - last_updated: Timestamp of last update
+        """
+        query = """
+        query {
+            platform_api {
+                daily_analytics {
+                    by_day {
+                        day
+                        usage
+                    }
+                    by_app {
+                        app {
+                            name
+                        }
+                        api_app_id
+                        usage
+                    }
+                    by_user {
+                        user {
+                            name
+                        }
+                        usage
+                    }
+                    last_updated
+                }
+            }
+        }
+        """
+        result = self.execute_query(query)
+        analytics = result.get("platform_api", {}).get("daily_analytics", {})
+
+        return {
+            "by_day": analytics.get("by_day", []),
+            "by_app": [
+                {
+                    "app_name": item.get("app", {}).get("name", "Unknown"),
+                    "api_app_id": item.get("api_app_id"),
+                    "usage": item.get("usage", 0)
+                }
+                for item in analytics.get("by_app", [])
+            ],
+            "by_user": [
+                {
+                    "user_name": item.get("user", {}).get("name", "Unknown"),
+                    "usage": item.get("usage", 0)
+                }
+                for item in analytics.get("by_user", [])
+            ],
+            "last_updated": analytics.get("last_updated"),
+        }
 
 
 # -----------------------------------------------------------------------------
