@@ -121,7 +121,8 @@ async def monday_webhook(
     event      = body.get("event", {})
     event_type = event.get("type", "")
     board_id   = str(event.get("boardId", ""))
-    item_id    = str(event.get("itemId", ""))
+    # Monday uses "pulseId" in create_pulse payloads (legacy name for items)
+    item_id    = str(event.get("itemId") or event.get("pulseId") or "")
 
     log.info(f"Event: type={event_type!r}  board={board_id}  item={item_id}")
 
@@ -136,7 +137,9 @@ async def monday_webhook(
     # Enrich on item creation or when the part-number column changes.
     # We deliberately do NOT subscribe to change_column_value broadly —
     # that would re-trigger on every column our own code writes, causing loops.
-    if event_type in ("create_item", "change_specific_column_value"):
+    # Note: Monday sends "create_pulse" in the payload even when the webhook
+    # was registered as "create_item" (pulse = legacy name for item).
+    if event_type in ("create_item", "create_pulse", "change_specific_column_value"):
         background_tasks.add_task(_enrich_item, board_id, item_id)
         return JSONResponse({"status": "accepted"})
 
