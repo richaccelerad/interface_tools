@@ -1,0 +1,73 @@
+# render.yaml — Render.com infrastructure blueprint
+#
+# Defines two services:
+#   1. epicor-monday-webhook  (web service, always-on)
+#      Listens for Monday.com webhooks and enriches items with Epicor data
+#      in real-time when parts are added to the board.
+#
+#   2. epicor-monday-sync  (cron job)
+#      Full board sweep every 6 hours to catch anything missed by webhooks
+#      and to refresh data on existing items.
+#
+# Deploy:
+#   render blueprint apply
+#
+# Set the env vars below in the Render dashboard (they are marked sync: false
+# so Render never tries to read them from a file on disk).
+
+services:
+
+  # ── Web service: webhook listener ─────────────────────────────────────────
+  - type: web
+    name: epicor-monday-webhook
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn webhook_server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+
+    envVars:
+      - key: EPICOR_BASE_URL
+        sync: false
+      - key: EPICOR_COMPANY
+        sync: false
+      - key: EPICOR_PLANT
+        sync: false
+      - key: EPICOR_API_KEY
+        sync: false
+      - key: EPICOR_USERNAME
+        sync: false
+      - key: EPICOR_PASSWORD
+        sync: false
+      - key: MONDAY_API_TOKEN
+        sync: false
+      - key: MONDAY_PARTS_BOARD_ID
+        sync: false
+      # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+      - key: MONDAY_WEBHOOK_SECRET
+        sync: false
+
+  # ── Cron job: full board sync ──────────────────────────────────────────────
+  - type: cron
+    name: epicor-monday-sync
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    schedule: "0 */6 * * *"   # every 6 hours
+    startCommand: python main.py
+
+    envVars:
+      - key: EPICOR_BASE_URL
+        sync: false
+      - key: EPICOR_COMPANY
+        sync: false
+      - key: EPICOR_PLANT
+        sync: false
+      - key: EPICOR_API_KEY
+        sync: false
+      - key: EPICOR_USERNAME
+        sync: false
+      - key: EPICOR_PASSWORD
+        sync: false
+      - key: MONDAY_API_TOKEN
+        sync: false
+      - key: MONDAY_PARTS_BOARD_ID
+        sync: false
