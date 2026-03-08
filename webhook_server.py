@@ -56,6 +56,15 @@ def _get_webhook_secret() -> str:
     return os.environ.get("MONDAY_WEBHOOK_SECRET", "") or getattr(config, "MONDAY_WEBHOOK_SECRET", "")
 
 
+def _get_board_ids() -> list[str]:
+    """Return the list of board IDs to handle, from config."""
+    ids = getattr(config, "MONDAY_PARTS_BOARD_IDS", None)
+    if ids:
+        return [str(b) for b in ids]
+    single = str(getattr(config, "MONDAY_PARTS_BOARD_ID", ""))
+    return [single] if single else []
+
+
 def _get_partnum_col_id(monday: MondayClient, board_id: str) -> str | None:
     """Return (and cache) the Monday column ID used for part numbers on this board."""
     if board_id not in _partnum_col_cache:
@@ -77,6 +86,16 @@ def _get_column_ids(monday: MondayClient, board_id: str) -> dict[str, str]:
     """Return (and cache) the PO-data column IDs for this board."""
     if board_id not in _column_ids_cache:
         _column_ids_cache[board_id] = get_column_ids(monday, board_id)
+    return _column_ids_cache[board_id]
+
+
+def _ensure_configured(monday: MondayClient, board_id: str) -> dict[str, str]:
+    """Configure board columns if not already done, return column_ids."""
+    if board_id not in _column_ids_cache:
+        from main import configure_board
+        configure_board(monday, board_id)
+        _column_ids_cache[board_id] = get_column_ids(monday, board_id)
+        log.info(f"Board {board_id} configured. Columns: {list(_column_ids_cache[board_id].keys())}")
     return _column_ids_cache[board_id]
 
 
@@ -129,9 +148,9 @@ async def monday_webhook(
     if not item_id or not board_id:
         return JSONResponse({"status": "ignored", "reason": "missing ids"})
 
-    # Only act on the configured parts board
-    if board_id != str(config.MONDAY_PARTS_BOARD_ID):
-        log.debug(f"Ignoring event for board {board_id} (not the parts board)")
+    # Only act on configured boards
+    if board_id not in _get_board_ids():
+        log.debug(f"Ignoring event for board {board_id} (not in configured boards)")
         return JSONResponse({"status": "ignored", "reason": "wrong board"})
 
     # Enrich on item creation or when the part-number column changes.
@@ -159,7 +178,7 @@ def _enrich_item(board_id: str, item_id: str) -> None:
     try:
         monday     = get_monday_client()
         epicor     = get_epicor_client()
-        column_ids = _get_column_ids(monday, board_id)
+        column_ids = _ensure_configured(monday, board_id)
 
         if not column_ids:
             log.warning(

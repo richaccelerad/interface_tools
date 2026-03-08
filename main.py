@@ -380,116 +380,122 @@ def main(limit: Optional[int] = None, sequential: bool = False):
     print("Connecting to Epicor...")
     epicor = get_epicor_client()
 
-    # Get column IDs for the board
-    print(f"\nGetting column configuration for board {config.MONDAY_PARTS_BOARD_ID}...")
-    column_ids = get_column_ids(monday, config.MONDAY_PARTS_BOARD_ID)
-    print(f"  Found columns: {list(column_ids.keys())}")
-
-    # Get PartNums from Monday.com
-    print(f"\nFetching items from board {config.MONDAY_PARTS_BOARD_ID}...")
-    items = get_partnums_from_monday(monday, config.MONDAY_PARTS_BOARD_ID)
-
-    # Apply limit if specified
-    if limit is not None and limit > 0:
-        items = items[:limit]
-        print(f"  (Limited to first {limit} items for testing)")
-
-    # Look up POs for each item and update Monday.com
-    print("\n" + "=" * 60)
-    print("Looking up POs in Epicor and updating Monday.com...")
-    if sequential:
-        print(f"Processing {len(items)} items sequentially...")
-    else:
-        print(f"Processing {len(items)} items with 3 parallel workers...")
-    print("=" * 60)
+    board_ids = getattr(config, "MONDAY_PARTS_BOARD_IDS", None) or [config.MONDAY_PARTS_BOARD_ID]
 
     all_results = {}
-    completed_count = 0
-    error_count = 0
-    updated_count = 0
-    skipped_count = 0
 
-    def handle_result(result, item):
-        """Process a single result and update counters."""
-        nonlocal completed_count, error_count, updated_count, skipped_count
+    for board_id in board_ids:
+        board_id = str(board_id)
 
-        completed_count += 1
-        partnum = result['partnum']
-        all_results[partnum] = result['po_lines']
+        print("\n" + "=" * 60)
+        print(f"Processing board {board_id}")
+        print("=" * 60)
 
-        # Track updates vs skips
-        if result.get('updated'):
-            updated_count += 1
+        # Get column IDs for the board
+        print(f"\nGetting column configuration for board {board_id}...")
+        column_ids = get_column_ids(monday, board_id)
+        print(f"  Found columns: {list(column_ids.keys())}")
+
+        # Get PartNums from Monday.com
+        print(f"\nFetching items from board {board_id}...")
+        items = get_partnums_from_monday(monday, board_id)
+
+        # Apply limit if specified
+        if limit is not None and limit > 0:
+            items = items[:limit]
+            print(f"  (Limited to first {limit} items for testing)")
+
+        # Look up POs for each item and update Monday.com
+        print("\nLooking up POs in Epicor and updating Monday.com...")
+        if sequential:
+            print(f"Processing {len(items)} items sequentially...")
         else:
-            skipped_count += 1
+            print(f"Processing {len(items)} items with 3 parallel workers...")
 
-        # Print progress
-        status_parts = []
-        if result['error']:
-            error_count += 1
-            status_parts.append(f"ERROR: {result['error']}")
-        else:
-            if result['categorized']:
-                cat = result['categorized']
-                status_parts.append(f"POs: {len(cat['open'])} open, {len(cat['closed_recent'])} recent, {len(cat['closed_old'])} old")
-            if result['inventory']:
-                status_parts.append(f"Inv: {result['inventory'].total_on_hand}")
-            elif result.get('inventory_error'):
-                status_parts.append("Inv: N/A")
-            # Indicate if update was skipped
-            if not result.get('updated'):
-                status_parts.append("(no change)")
+        completed_count = 0
+        error_count = 0
+        updated_count = 0
+        skipped_count = 0
 
-        status = " | ".join(status_parts) if status_parts else "OK"
-        print(f"[{completed_count}/{len(items)}] {result['item_name']}: {status}")
+        def handle_result(result, item):
+            """Process a single result and update counters."""
+            nonlocal completed_count, error_count, updated_count, skipped_count
 
-    if sequential:
-        # Sequential processing - one item at a time
-        for item in items:
-            try:
-                result = process_item(epicor, monday, config.MONDAY_PARTS_BOARD_ID, column_ids, item)
-                handle_result(result, item)
-            except Exception as e:
-                completed_count += 1
+            completed_count += 1
+            partnum = result['partnum']
+            all_results[partnum] = result['po_lines']
+
+            # Track updates vs skips
+            if result.get('updated'):
+                updated_count += 1
+            else:
+                skipped_count += 1
+
+            # Print progress
+            status_parts = []
+            if result['error']:
                 error_count += 1
-                all_results[item['partnum']] = []
-                print(f"[{completed_count}/{len(items)}] {item['item_name']}: FAILED - {e}")
-    else:
-        # Parallel processing with thread pool
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                executor.submit(process_item, epicor, monday, config.MONDAY_PARTS_BOARD_ID, column_ids, item): item
-                for item in items
-            }
+                status_parts.append(f"ERROR: {result['error']}")
+            else:
+                if result['categorized']:
+                    cat = result['categorized']
+                    status_parts.append(f"POs: {len(cat['open'])} open, {len(cat['closed_recent'])} recent, {len(cat['closed_old'])} old")
+                if result['inventory']:
+                    status_parts.append(f"Inv: {result['inventory'].total_on_hand}")
+                elif result.get('inventory_error'):
+                    status_parts.append("Inv: N/A")
+                # Indicate if update was skipped
+                if not result.get('updated'):
+                    status_parts.append("(no change)")
 
-            for future in as_completed(futures):
-                item = futures[future]
+            status = " | ".join(status_parts) if status_parts else "OK"
+            print(f"[{completed_count}/{len(items)}] {result['item_name']}: {status}")
+
+        if sequential:
+            # Sequential processing - one item at a time
+            for item in items:
                 try:
-                    result = future.result()
+                    result = process_item(epicor, monday, board_id, column_ids, item)
                     handle_result(result, item)
                 except Exception as e:
                     completed_count += 1
                     error_count += 1
                     all_results[item['partnum']] = []
                     print(f"[{completed_count}/{len(items)}] {item['item_name']}: FAILED - {e}")
+        else:
+            # Parallel processing with thread pool
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {
+                    executor.submit(process_item, epicor, monday, board_id, column_ids, item): item
+                    for item in items
+                }
 
-    # Summary
-    print("\n" + "=" * 60)
-    print("Summary")
-    print("=" * 60)
-    total_pos = sum(len(pos) for pos in all_results.values())
-    parts_with_pos = sum(1 for pos in all_results.values() if pos)
-    print(f"Items processed: {len(items)}")
-    print(f"Parts with POs: {parts_with_pos}")
-    print(f"Total PO lines found: {total_pos}")
-    print(f"Monday.com updates: {updated_count} updated, {skipped_count} unchanged")
-    if error_count > 0:
-        print(f"Errors: {error_count}")
+                for future in as_completed(futures):
+                    item = futures[future]
+                    try:
+                        result = future.result()
+                        handle_result(result, item)
+                    except Exception as e:
+                        completed_count += 1
+                        error_count += 1
+                        all_results[item['partnum']] = []
+                        print(f"[{completed_count}/{len(items)}] {item['item_name']}: FAILED - {e}")
+
+        # Board summary
+        print(f"\nBoard {board_id} summary:")
+        total_pos = sum(len(pos) for pos in all_results.values())
+        parts_with_pos = sum(1 for pos in all_results.values() if pos)
+        print(f"  Items processed: {len(items)}")
+        print(f"  Parts with POs: {parts_with_pos}")
+        print(f"  Total PO lines found: {total_pos}")
+        print(f"  Monday.com updates: {updated_count} updated, {skipped_count} unchanged")
+        if error_count > 0:
+            print(f"  Errors: {error_count}")
 
     # Show Monday.com rate limit stats if any retries occurred
     rate_stats = monday.rate_limit_stats
     if rate_stats["rate_limit_hits"] > 0:
-        print(f"Monday.com rate limits hit: {rate_stats['rate_limit_hits']} "
+        print(f"\nMonday.com rate limits hit: {rate_stats['rate_limit_hits']} "
               f"(retries: {rate_stats['total_retries']})")
 
     return all_results
@@ -624,8 +630,13 @@ Examples:
     if len(sys.argv) > 1 and sys.argv[1] == "--configure":
         # Run board configuration only
         monday = get_monday_client()
-        board_id = sys.argv[2] if len(sys.argv) > 2 else config.MONDAY_PARTS_BOARD_ID
-        configure_board(monday, board_id)
+        if len(sys.argv) > 2:
+            # Explicit board ID on the command line
+            configure_board(monday, sys.argv[2])
+        else:
+            board_ids = getattr(config, "MONDAY_PARTS_BOARD_IDS", None) or [config.MONDAY_PARTS_BOARD_ID]
+            for board_id in board_ids:
+                configure_board(monday, str(board_id))
 
     elif len(sys.argv) > 1 and sys.argv[1] == "--usage":
         # Show API usage
